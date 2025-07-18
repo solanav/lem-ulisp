@@ -1,60 +1,90 @@
-(defpackage pico-repl
+(defpackage lem-ulisp
   (:use #:cl)
   (:local-nicknames 
-   (:a :alexandria)
-   (:s :serapeum)
-   (:c :cserial-port))
-  (:export :eval-read))
-(in-package #:pico-repl)
+   (:a #:alexandria)
+   (:s #:serapeum)
+   (:c #:cserial-port))
+  (:export :*tty*
+           :*serial-read-timeout-ms*
+           :eval-print
+           :read-eval-print))
+(in-package #:lem-ulisp)
 
+;; Device to read from
 (defparameter *tty* #P"/dev/ttyUSB0")
 
-(defun carriage-p (n) (= n 13))
+;; Timeout when reading from serial 
+;; It does not apply to the waiting for a response, only for echo and clear
+(defparameter *serial-read-timeout-ms* 100)
 
-(defun try-read-serial (serial)
-  "reads from tty a string or nil if finished"
-  (let ((res (make-array 32 :element-type '(unsigned-byte 8))))
-    (let ((total-read (handler-case
-                          (c:read-serial-byte-vector
-                           res serial :timeout-ms 500)
-                        (error () 0))))
-      (when (plusp total-read)
-        (babel:octets-to-string res :end total-read)))))
+(defun serial-finished-p (arr) 
+  "check that the two last bytes of the array are CR and LF "
+  (let ((len (length arr)))
+    (when (>= len 2)
+      (let ((last-byte (code-char (aref arr (- len 1))))
+            (second-to-last-byte (code-char (aref arr (- len 2)))))
+        (cond ((and (eq second-to-last-byte #\Return)
+                    (eq last-byte #\Newline))
+               :crlf)
+              ((and (eq second-to-last-byte #\>)
+                    (eq last-byte #\Space))
+               :repl)
+              (t nil))))))
 
-(defun read-serial-raw ()
-  "reads from tty and return the string"
-  (c:with-serial (rs *tty*)
-    (let ((res (loop :for res := (try-read-serial rs)
-                     :while res 
-                     :collect res)))
-      (when res
-        (s:~>> res
-               (format nil "~{~a~}")
-               (str:split #\Return)
-               (mapcar #'str:trim))))))
+(defun parse-line (buff)
+  "convert the bytes into a line without CRLF and without the `> ` of the REPL"
+  (when (plusp (length buff))
+    (babel:octets-to-string
+     buff :end (- (length buff) 2))))
 
-(defun read-serial ()
-  "reads from tty and return the result, echo and memory left"
-  (a:when-let ((output (read-serial-raw)))
-    (let* ((len (length output))
-           (echo (car output))
-           (results (subseq output 1 (1- len)))
-           (memory (s:slice (last output) 0 -1)))
-      (values (str:trim-right (str:join #\Newline results))
+(defun read-serial-line (serial &key (timeout-ms *serial-read-timeout-ms*))
+  "read until CRLF/REPL and return as a string"
+  (loop :with buff := (make-array 0 :element-type '(unsigned-byte 8) 
+                                  :adjustable t
+                                  :fill-pointer t)
+        :for c := (ignore-errors
+                    (c:read-serial-byte
+                     serial :timeout-ms timeout-ms))
+        ;; :do (format t "Read: ~a (~a : \"~a\")~%" c buff (ignore-errors (babel:octets-to-string buff)))
+        :while c
+        :do (vector-push-extend c buff)
+        :until (serial-finished-p buff)
+        :finally (return (parse-line buff))))
+
+(defun read-serial-until-repl (serial)
+  "read until we hit the REPL"
+  (loop :with buff := (make-array 0 :element-type '(unsigned-byte 8) 
+                                  :adjustable t
+                                  :fill-pointer t)
+        :for c := (c:read-serial-byte serial)
+        :do (vector-push-extend c buff)
+        :until (eq (serial-finished-p buff) :repl)
+        :finally (return (str:split (s:fmt "~a~a" #\Return #\Newline)
+                                    (babel:octets-to-string buff)))))
+
+(defun clean-serial (serial)
+  "read bytes from serial until it times out"
+  (loop :while (ignore-errors
+                 (c:read-serial-byte
+                  serial :timeout-ms *serial-read-timeout-ms*))))
+
+(defun read-serial-response (serial)
+  "read from serial and parse into output, echo and memory left"
+  (flet ((stdout (rest) (str:join #\Newline (s:slice rest 0 -1)))
+         (memory (rest) (parse-integer (s:slice (car (last rest)) 0 -2))))
+    (let ((echo (read-serial-line serial :timeout-ms nil))
+          (rest (read-serial-until-repl serial)))
+      (values (stdout rest)
               echo
-              memory))))
+              (memory rest)))))
 
-(defun write-serial (sexp)
-  "send a string to the tty"
-  (c:with-serial (ws *tty*)
-    (c:write-serial-string sexp ws)))
+(defun eval-print (sexp)
+  "eval a string in the picocalc and return the results"
+  (c:with-serial (serial *tty*)
+    (clean-serial serial)
+    (c:write-serial-string sexp serial)
+    (read-serial-response serial)))
 
-(defun eval-read (sexp)
-  "eval a string in the picocalc"
-  (read-serial)
-  (write-serial sexp)
-  (with-input-from-string (s (read-serial))
-    (read s)))
-
-(defmacro eval-read-exp (sexp)
-  `(eval-read (prin1-to-string ',sexp)))
+(defmacro read-eval-print (sexp)
+  "convert the sexp into a string, eval it in picocalc and return the results"
+  `(eval-print (prin1-to-string ',sexp)))

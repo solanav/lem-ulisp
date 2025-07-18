@@ -1,12 +1,12 @@
-(defsystem "lem-ulisp""
+(defsystem "lem-ulisp"
   :version "0.0.1"
   :author "Antonio Solana"
-  :license ""
-  :depends-on (:alexandria
-               :serapeum
-               :cserial-port
-               :str)
+  :license "GPLv3"
+  :depends-on ("alexandria"
+               "serapeum"
+               "cserial-port"
+               "str")
   :components ((:module "src"
                 :components
                 ((:file "main"))))
-  :description "Communicate with the serial port")
+  :description "Communicate with a uLisp device through the serial port")
